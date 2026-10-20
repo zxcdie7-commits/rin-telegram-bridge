@@ -1,4 +1,5 @@
 """Все настройки моста в одном месте: пути, ключи, модели, лимиты, тексты личности."""
+import json
 import logging
 import re
 import shutil
@@ -44,7 +45,7 @@ CFG = load_env(BASE / ".env")
 # --- Внешние программы (пути можно переопределить в .env)
 FFMPEG = CFG.get("FFMPEG") or shutil.which("ffmpeg") or "ffmpeg"
 STT_CMD = [CFG.get("STT_PYTHON") or sys.executable, str(BASE / "stt.py")]   # запасная расшифровка (faster-whisper)
-APIS_PY = Path(CFG["GIF_SCRIPT"]).expanduser() if CFG.get("GIF_SCRIPT") else None  # скрипт «<script> gif <реакция>» → путь к гифке
+APIS_PY = Path(CFG["GIF_SCRIPT"]).expanduser() if CFG.get("GIF_SCRIPT") else None  # «<script> gif <реакция>» → гифка
 
 # --- Telegram / владелец
 TG_API_ID = CFG.get("TG_API_ID")
@@ -58,8 +59,9 @@ MAX_TG = 4000
 # --- Hermes (полная Рин для владельца)
 HERMES_URL = CFG.get("HERMES_URL", "http://127.0.0.1:8642")
 MODELS = {
-    "iq": {"model": "deepseek/deepseek-v4-flash", "provider": "openrouter"},
-    "pro": {"model": "deepseek/deepseek-v4-pro", "provider": "openrouter"},
+    "iq": {"model": "anthropic/claude-haiku-5.5", "provider": "openrouter"},     # быстрая: ~1 с до первого слова
+    "pro": {"model": "anthropic/claude-sonnet-5.5", "provider": "openrouter"},   # умнее, медленнее
+    "deepseek": {"model": "deepseek/deepseek-v4-flash", "provider": "openrouter"},
     "local": {"model": "qwen3.5:4b", "provider": "local"},
 }
 DEFAULT_MODEL = CFG.get("DEFAULT_MODEL", "iq")
@@ -80,6 +82,18 @@ HERMES_CHANNEL_NOTE = (
 # --- Публичная Рин (чужие люди) и поручения
 PUBLIC_MODE = CFG.get("PUBLIC_MODE", "0") == "1"
 PUBLIC_MODEL = CFG.get("PUBLIC_MODEL", "deepseek/deepseek-v4-flash")
+CALL_MODEL = CFG.get("CALL_MODEL", "anthropic/claude-haiku-5.5")   # звонки: важна скорость ответа
+SWITCHES_FILE = HOME / ".hermes" / "rin_switches.json"   # переключатели из значка Рин в строке меню Мака
+
+
+def answer_calls():
+    """Чужие звонки: Рин берёт трубку за владельца, только когда он включил это в значке Рин (по умолчанию — сбрасывать)."""
+    if CFG.get("ANSWER_CALLS") in ("0", "1"):   # .env главнее значка: без Мака переключатель задаётся здесь
+        return CFG["ANSWER_CALLS"] == "1"
+    try:
+        return bool(json.loads(SWITCHES_FILE.read_text()).get("answer_calls", False))
+    except (OSError, ValueError):
+        return False
 PUBLIC_DAILY_PER_USER = int(CFG.get("PUBLIC_DAILY_PER_USER", "30"))
 PUBLIC_DAILY_TOTAL = int(CFG.get("PUBLIC_DAILY_TOTAL", "500"))
 PUBLIC_HISTORY_LEN = 20

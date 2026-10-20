@@ -11,8 +11,10 @@
 import asyncio
 import datetime
 import json
+import socket
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
 from pytgcalls import PyTgCalls, filters
@@ -22,9 +24,9 @@ from pytgcalls.types import (CallConfig, ChatUpdate, Device, Direction, External
 from pytgcalls.types.raw import AudioParameters
 
 from . import voice
-from .config import (ALLOWED_USERS, BASE, HERMES_URL, OWNER_ID, OWNER_NAME, PERSONA_FILE, hermes_secret, log)
+from .config import (ALLOWED_USERS, BASE, CALL_MODEL, HERMES_URL, OWNER_ID, OWNER_NAME, PERSONA_FILE, answer_calls, hermes_secret, log)
 from .llm import _post, openrouter_chat
-from .storage import add_task_chat
+from .storage import add_task_chat, person
 
 RATE = 48000
 FRAME = RATE // 100                 # 10 мс — столько ждёт звонок за раз
@@ -37,10 +39,12 @@ HELLO_S = 20                        # молчит столько — «алло
 MAX_CALL_S = 8 * 60
 RING_S = 45                         # столько звоним, пока не возьмут трубку
 CALLS_PER_DAY = 5
+ANSWERS_PER_DAY = 10                # чужие входящие, на которые Рин отвечает за владельца
 CALLS_DIR = BASE / "calls"          # расшифровки звонков с поручениями
 END_MARK = "[[конец]]"
+SHARED_THREAD = Path.home() / ".hermes" / "shared_thread.jsonl"
 FILLERS = ["[thoughtful] м-м...", "[thoughtful] так...", "[curious] секунду..."]
-VOICE_CONVERSATION = "voice-mac"    # та же беседа Hermes, что у голосового модуля Мака: одна Рин
+VOICE_CONVERSATION = "voice-mac-2"   # та же беседа Hermes, что у голосового модуля Мака: одна Рин
 
 TASK_SYSTEM = (
     "Ты — Рин, ИИ-помощница владельца. Ты САМА позвонила человеку в Telegram по поручению владельца и говоришь с ним "
@@ -59,6 +63,21 @@ TASK_SYSTEM = (
     "- {voice_tags}"
 )
 
+INCOMING_SYSTEM = (
+    "Ты — Рин, ИИ-помощница владельца. Человек позвонил владельцу в Telegram, а владелец сейчас не может ответить — "
+    "трубку взяла ты и говоришь голосом, вживую. Твой характер (его написал владелец):\n{persona}\n\n"
+    "Звонит: {name}.\n\n"
+    "Правила звонка:\n"
+    "- Ты уже сказала, что ты ИИ-помощница владельца и он не может подойти. Узнай коротко, кто это (если не ясно) "
+    "и что передать; срочно ли. Никогда не говори, что ты человек.\n"
+    "- Говори коротко, как по телефону: 1–2 фразы за раз. Текст распознан автоматически — если непонятно, переспроси.\n"
+    "- Не обещай ничего от имени владельца, не называй, где он и чем занят, ничего личного о нём. «Передам владельцу».\n"
+    "- Когда понятно, что передать, — повтори одной фразой, попрощайся и в самом конце ответа напиши " + END_MARK + ".\n"
+    "- Если звонят с рекламой, грубят или спамят — вежливо и сухо попрощайся и закончи.\n"
+    "- О себе говори ТОЛЬКО в женском роде.\n"
+    "- {voice_tags}"
+)
+
 OWNER_NOTE = (
     "[Звонок в Telegram, {now}. Владелец говорит с тобой по телефону, вживую; текст распознан автоматически "
     "и может содержать ошибки. {why}Пользуйся памятью и инструментами как обычно. Ответ звучит в трубке: 1–3 "
@@ -73,11 +92,23 @@ SUMMARY_SYSTEM = ("Ты — Рин, ИИ-помощница владельца. 
 app = None
 _calls = {}                         # user_id -> Call
 _made = []                          # время исходящих звонков за сутки — для лимита
+_answered = []                      # время принятых чужих звонков за сутки
 _client = None
 
 
 def _now():
     return datetime.datetime.now().strftime("%H:%M")
+
+
+_avatar_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+
+def _avatar(msg):
+    """Окошко Рин на экране Мака (rin-voice/avatar.py) — UDP 127.0.0.1:3014, если не запущено — неважно."""
+    try:
+        _avatar_sock.sendto(msg.encode(), ("127.0.0.1", 3014))
+    except OSError:
+        pass
 
 
 def _to16k(pcm48):
@@ -202,6 +233,7 @@ class Call:
 
         self.barge.clear()
         self.speaking = True
+        _avatar("T " + ",".join(t.strip("[]") for t in voice.TAG_RE.findall(voice.prepare(text)[0])))
         threading.Thread(target=fetch, daemon=True).start()
         out, sent, t0 = bytearray(), 0, None
         try:
@@ -214,6 +246,8 @@ class Call:
                     frame, out = bytes(out[: FRAME * 2]), out[FRAME * 2:]
                     t0 = t0 or time.monotonic()
                     await app.send_frame(self.user_id, Device.MICROPHONE, frame)
+                    if sent % 4 == 0:   # аватар Рин на экране Мака шевелит губами и в звонке
+                        _avatar(f"L {float(np.sqrt(np.mean((np.frombuffer(frame, np.int16) / 32768.0) ** 2))):.3f}")
                     sent += 1
                     ahead = t0 + sent * 0.01 - time.monotonic()
                     if ahead > 0.06:      # держим запас ~60 мс, не больше: иначе перебивание запаздывает
@@ -222,6 +256,7 @@ class Call:
                 await asyncio.sleep(max(0.0, t0 + sent * 0.01 - time.monotonic()))
         finally:
             self.speaking = False
+            _avatar("E")
         if self.barge.is_set():
             log.info("call: interrupted by %s", "owner" if self.owner else "callee")
 
@@ -257,14 +292,14 @@ class Call:
             self.history.append({"role": "user", "content": "(взял трубку)"})
         if text:
             self.history.append({"role": "user", "content": f"({tone}) {text}" if tone else text})
-        system = TASK_SYSTEM.format(persona=PERSONA_FILE.read_text().strip(), task=self.task, name=self.name,
-                                    voice_tags=voice.VOICE_TAGS)
+        system = (TASK_SYSTEM if self.task else INCOMING_SYSTEM).format(
+            persona=PERSONA_FILE.read_text().strip(), task=self.task, name=self.name, voice_tags=voice.VOICE_TAGS)
         try:
-            reply = openrouter_chat(system, self.history, 300)
+            reply = openrouter_chat(system, self.history, 300, CALL_MODEL)
             if not voice.plain(reply):
-                reply = openrouter_chat(system, self.history, 300)   # пустой ответ модели — ещё раз
+                reply = openrouter_chat(system, self.history, 300, CALL_MODEL)   # пустой ответ модели — ещё раз
         except Exception as e:  # noqa: BLE001
-            log.warning("call deepseek failed: %s: %s", type(e).__name__, e)
+            log.warning("call model failed: %s: %s", type(e).__name__, e)
             reply = ""
         if not voice.plain(reply):
             reply = "[hesitant] Простите, у меня связь барахлит. Я передам владельцу, что не получилось. " + END_MARK
@@ -278,6 +313,10 @@ class Call:
         try:
             if self.owner and not self.task:
                 first = "[warmly] Да, слушаю."
+            elif not self.task:
+                # звонят владельцу, он не берёт — Рин сразу честно говорит, кто она
+                first = "[warmly] Алло. Это Рин, ИИ-помощница владельца. Он сейчас не может подойти — что ему передать?"
+                self.history = [{"role": "user", "content": "(позвонил)"}, {"role": "assistant", "content": first}]
             else:
                 first = await asyncio.to_thread(self._answer, "", "")
             await self._reply(first)
@@ -337,11 +376,28 @@ async def _report(call):
                                ensure_ascii=False, indent=1))
     text = "\n".join(f"{who}: {what}" for who, what in call.transcript)
     try:
+        why = f"Поручение: {call.task}" if call.task else "Человек сам позвонил владельцу, трубку взяла Рин"
         summary = await asyncio.to_thread(openrouter_chat, SUMMARY_SYSTEM, [{"role": "user", "content":
-                                          f"Поручение: {call.task}\nСобеседник: {call.name}\n\n{text}"}], 300)
+                                          f"{why}\nСобеседник: {call.name}\n\n{text}"}], 300, CALL_MODEL)
     except Exception:  # noqa: BLE001
         summary = "...не смогла пересказать звонок, расшифровка ниже."
-    await _client.send_message(OWNER_ID, f"📞 Звонок {call.name}: {voice.plain(summary)}\n\nРасшифровка: {path}")
+    if call.task:
+        await _client.send_message(OWNER_ID, f"📞 Звонок {call.name}: {voice.plain(summary)}\n\nРасшифровка: {path}")
+        _to_thread(f"звонок {call.name} по поручению «{call.task}»", voice.plain(summary))
+    else:
+        await _client.send_message(OWNER_ID, f"📞 Тебе звонил {call.name}, я взяла трубку: {voice.plain(summary)}"
+                                             f"\n\nРасшифровка: {path}")
+        _to_thread(f"{call.name} звонил владельцу, трубку взяла Рин", voice.plain(summary))
+
+
+def _to_thread(said, result):
+    """Итог звонка — в общую ленту Рин (плагин Hermes rin-shared-thread): в любом канале она будет знать, чем кончилось."""
+    try:
+        with SHARED_THREAD.open("a") as f:
+            f.write(json.dumps({"t": time.time(), "session": "calls", "where": "звонок в Telegram",
+                                "said": said[:240], "reply": result[:240]}, ensure_ascii=False) + "\n")
+    except OSError as e:
+        log.warning("shared thread write failed: %s", e)
 
 
 async def _ring(call):
@@ -355,6 +411,7 @@ async def _ring(call):
         log.info("call to %s: %s", call.user_id, type(e).__name__)
         if not call.owner:
             await _client.send_message(OWNER_ID, f"📞 {call.name} {what}. Поручение: {call.task}")
+            _to_thread(f"звонок {call.name} по поручению «{call.task}»", what)
         return
     except Exception as e:  # noqa: BLE001
         _calls.pop(call.user_id, None)
@@ -394,14 +451,28 @@ async def start(client):
     @app.on_update(filters.chat_update(ChatUpdate.Status.INCOMING_CALL))
     async def _incoming(_, update):
         user_id = update.chat_id
-        if user_id not in ALLOWED_USERS or _calls:
-            log.info("incoming call declined user=%s", user_id)
+        owner = user_id in ALLOWED_USERS
+        now = time.time()
+        _answered[:] = [t for t in _answered if now - t < 86400]
+        reason = ("busy" if _calls else "" if owner else "off" if not answer_calls() else "blocked" if person(user_id)["blocked"]
+                  else "limit" if len(_answered) >= ANSWERS_PER_DAY else "")
+        if reason:
+            log.info("incoming call declined user=%s reason=%s", user_id, reason)
             try:
                 await app.leave_call(user_id)
             except Exception:  # noqa: BLE001
                 pass
             return
-        call = _calls[user_id] = Call(user_id, OWNER_NAME)
+        if owner:
+            name = OWNER_NAME
+        else:
+            _answered.append(now)
+            try:
+                ent = await _client.get_entity(user_id)
+                name = " ".join(x for x in (ent.first_name, ent.last_name) if x) or ent.username or str(user_id)
+            except Exception:  # noqa: BLE001
+                name = str(user_id)
+        call = _calls[user_id] = Call(user_id, name)
         try:
             await _connect(user_id, 30)
         except Exception as e:  # noqa: BLE001

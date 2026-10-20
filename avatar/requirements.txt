@@ -1,0 +1,4 @@
+pyobjc-framework-Cocoa
+pyobjc-framework-Quartz
+pillow
+rembg[cpu]   # только для avatar_art.py — вырезать фон с листа персонажа

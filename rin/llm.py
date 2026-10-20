@@ -62,9 +62,9 @@ def run_approve(run_id, request_id, choice):
     return _post(f"{HERMES_URL}/v1/runs/{run_id}/approval", body, _hermes_auth(), timeout=30)
 
 
-def openrouter_chat(system, messages, max_tokens):
+def openrouter_chat(system, messages, max_tokens, model=None):
     """Упрощённая Рин: без инструментов и памяти. Бросает исключение при ошибке."""
-    body = {"model": PUBLIC_MODEL, "max_tokens": max_tokens,
+    body = {"model": model or PUBLIC_MODEL, "max_tokens": max_tokens,
             "messages": [{"role": "system", "content": system}] + messages}
     data = _post("https://openrouter.ai/api/v1/chat/completions", body,
                  {"Authorization": f"Bearer {hermes_secret('OPENROUTER_API_KEY')}"}, timeout=120)
