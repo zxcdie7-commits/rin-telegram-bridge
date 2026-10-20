@@ -151,6 +151,23 @@ def pre_llm_call(session_id=None, user_message=None, platform=None, **kwargs):
         + soul)}
 
 
+LONG_SLEEP = re.compile(r"\bsleep\s+(\d+)")
+MAX_SLEEP_S = 10
+
+
+def pre_tool_call(tool_name=None, args=None, **kwargs):
+    """Рин не ждёт в чате: звонок идёт в фоне, итог придёт владельцу сам. Долгий sleep = минуты молчания в Telegram."""
+    if tool_name != "terminal":
+        return None
+    command = str((args or {}).get("command", ""))
+    if any(int(n) > MAX_SLEEP_S for n in LONG_SLEEP.findall(command)):
+        return {"action": "block", "message": (
+            "Не жди: звонки и другие фоновые дела идут сами, итог придёт владельцу сообщением автоматически. "
+            "Не ставь sleep дольше 10 секунд и не проверяй calls/ — ответь ему прямо сейчас.")}
+    return None
+
+
 def register(ctx):
     ctx.register_hook("pre_llm_call", pre_llm_call)
     ctx.register_hook("post_llm_call", post_llm_call)
+    ctx.register_hook("pre_tool_call", pre_tool_call)
