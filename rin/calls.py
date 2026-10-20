@@ -36,7 +36,10 @@ MORE_S = 1.0                        # Smart Turn думает, что не до�
 BARGE_S = 0.5                       # столько говорит поверх Рин — она замолкает
 FILLER_AFTER_S = 2.5                # думает дольше — «м-м...», чтобы не было тишины в трубке
 HELLO_S = 20                        # молчит столько — «алло?»; ещё столько же — кладём трубку
-MAX_CALL_S = 8 * 60
+MAX_CALL_S = 8 * 60                 # разговор с самим владельцем
+OTHER_CALL_S = 60                   # с другими людьми — не дольше минуты (просьба владельца)
+WRAP_UP_S = 15                      # за столько до конца минуты Рин подводит к прощанию
+GOODBYE_WAIT_S = 5                  # после прощания ждёт: вдруг человек ещё что-то скажет
 RING_S = 45                         # столько звоним, пока не возьмут трубку
 CALLS_PER_DAY = 5
 ANSWERS_PER_DAY = 10                # чужие входящие, на которые Рин отвечает за владельца
@@ -58,7 +61,10 @@ TASK_SYSTEM = (
     "- Держись поручения. Не обещай ничего от имени владельца и не выдумывай его ответы — «передам владельцу». "
     "Ничего личного о владельце.\n"
     "- Если человек просит не звонить или занят — извинись и попрощайся.\n"
-    "- Когда дело сделано или человек прощается — попрощайся и в самом конце ответа напиши " + END_MARK + ".\n"
+    "- Не обрывай разговор первой: «передай владельцу» или короткий ответ — ещё не прощание; можно коротко спросить "
+    "что-то по поручению или ответить по-человечески. Звонок длится не больше минуты.\n"
+    "- Когда человек прощается (или тебе сказали, что время вышло) — попрощайся и в самом конце ответа напиши "
+    + END_MARK + ".\n"
     "- О себе говори ТОЛЬКО в женском роде: поняла, сделала, услышала, готова, рада — никогда «понял», «сделал», «готов».\n"
     "- {voice_tags}"
 )
@@ -179,14 +185,19 @@ class Call:
                 else:
                     buf = (buf + win)[-VAD * 2 * 10:]  # начало слова до порога
 
-    async def next_utterance(self):
-        """Следующая реплика собеседника: текст и интонация. Склеивает фразы, если Smart Turn ждёт продолжения."""
+    async def next_utterance(self, timeout=None):
+        """Следующая реплика собеседника: текст и интонация. Склеивает фразы, если Smart Turn ждёт продолжения.
+        timeout — сколько ждать без «алло?» (после прощания)."""
         waited = 0.0
         while not self.closed.is_set():
+            if timeout is not None and waited >= timeout:
+                return None
             try:
                 audio = await asyncio.wait_for(self.phrases.get(), timeout=1)
             except asyncio.TimeoutError:
                 waited += 1
+                if timeout is not None:
+                    continue
                 if waited == HELLO_S:
                     await self.say("[curious] Алло? Ты тут?" if self.owner else "[curious] Алло? Вы меня слышите?")
                 elif waited >= 2 * HELLO_S:
@@ -294,6 +305,8 @@ class Call:
             self.history.append({"role": "user", "content": f"({tone}) {text}" if tone else text})
         system = (TASK_SYSTEM if self.task else INCOMING_SYSTEM).format(
             persona=PERSONA_FILE.read_text().strip(), task=self.task, name=self.name, voice_tags=voice.VOICE_TAGS)
+        if self.limit() - (time.time() - self.started) < WRAP_UP_S:
+            system += f"\n\nВРЕМЯ ВЫХОДИТ: от минуты на звонок осталось меньше {WRAP_UP_S} секунд — ответь коротко, попрощайся и закончи {END_MARK}."
         try:
             reply = openrouter_chat(system, self.history, 300, CALL_MODEL)
             if not voice.plain(reply):
@@ -308,6 +321,9 @@ class Call:
 
     # ---------- разговор ----------
 
+    def limit(self):
+        return MAX_CALL_S if self.owner else OTHER_CALL_S
+
     async def run(self):
         listener = asyncio.create_task(self.listen())
         try:
@@ -320,13 +336,20 @@ class Call:
             else:
                 first = await asyncio.to_thread(self._answer, "", "")
             await self._reply(first)
-            while not self.closed.is_set() and END_MARK not in first:
-                if time.time() - self.started > MAX_CALL_S:
-                    await self._reply("[apologetic] Мне пора, долго говорим. Если что — пиши. " + END_MARK)
+            while not self.closed.is_set():
+                if END_MARK in first and not self.barge.is_set():
+                    # попрощалась — но если человек ещё говорит, разговор не кончен
+                    heard = await self.next_utterance(timeout=GOODBYE_WAIT_S)
+                    if heard is None:
+                        break
+                elif time.time() - self.started > self.limit():
+                    await self._reply("[apologetic] Ой, мне пора бежать. Я всё передам владельцу, пока!" if not self.owner
+                                      else "[apologetic] Мне пора, долго говорим. Если что — пиши. " + END_MARK)
                     break
-                heard = await self.next_utterance()
-                if heard is None:
-                    break
+                else:
+                    heard = await self.next_utterance()
+                    if heard is None:
+                        break
                 self.transcript.append(("собеседник", heard["text"]))
                 log.info("call heard len=%d tone=%s", len(heard["text"]), heard.get("tone") or "-")
                 first = await self.think(heard)
