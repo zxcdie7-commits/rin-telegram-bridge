@@ -64,7 +64,8 @@ def run_approve(run_id, request_id, choice):
 
 def openrouter_chat(system, messages, max_tokens, model=None):
     """Упрощённая Рин: без инструментов и памяти. Бросает исключение при ошибке."""
-    body = {"model": model or PUBLIC_MODEL, "max_tokens": max_tokens,
+    # без «раздумий»: иначе Claude через OpenRouter тратит на них все max_tokens и отвечает пустотой
+    body = {"model": model or PUBLIC_MODEL, "max_tokens": max_tokens, "reasoning": {"enabled": False},
             "messages": [{"role": "system", "content": system}] + messages}
     data = _post("https://openrouter.ai/api/v1/chat/completions", body,
                  {"Authorization": f"Bearer {hermes_secret('OPENROUTER_API_KEY')}"}, timeout=120)
