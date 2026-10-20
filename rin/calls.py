@@ -123,6 +123,29 @@ def _to16k(pcm48):
     return x[: len(x) // 3 * 3].reshape(-1, 3).mean(axis=1)
 
 
+def _hear(pcm48):
+    """Речь из звонка: через голосовой модуль Мака, а если он лежит — запасной локальный whisper (медленнее, но слышит)."""
+    audio = _to16k(pcm48)
+    heard = voice.hear_pcm(audio, True)
+    if heard is not None:
+        return heard
+    import wave
+    from .media import _transcribe_whisper_small, tmp_file
+    path = tmp_file("call_", ".wav")
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes((np.clip(audio, -1, 1) * 32767).astype(np.int16).tobytes())
+    try:
+        return {"text": _transcribe_whisper_small(path), "tone": "", "turn": None}
+    except Exception as e:  # noqa: BLE001
+        log.warning("call fallback stt failed: %s", type(e).__name__)
+        return None
+    finally:
+        Path(path).unlink(missing_ok=True)
+
+
 def _to48k(pcm24):
     """int16 24 кГц от ElevenLabs -> int16 48 кГц для звонка."""
     x = np.frombuffer(pcm24, dtype=np.int16).astype(np.float32)
@@ -203,7 +226,7 @@ class Call:
                 elif waited >= 2 * HELLO_S:
                     return None
                 continue
-            heard = await asyncio.to_thread(voice.hear_pcm, _to16k(audio), True)
+            heard = await asyncio.to_thread(_hear, audio)
             if not heard or not heard.get("text"):
                 continue
             while heard.get("turn") is not None and heard["turn"] < 0.5:
@@ -212,7 +235,7 @@ class Call:
                 except asyncio.TimeoutError:
                     break
                 audio += more
-                heard = await asyncio.to_thread(voice.hear_pcm, _to16k(audio), True) or heard
+                heard = await asyncio.to_thread(_hear, audio) or heard
             return heard
         return None
 
