@@ -463,7 +463,8 @@ async def start_call(entity, task):
     asyncio.get_running_loop().create_task(_ring(call))
     log.info("call requested to=%s owner=%s", entity.id, call.owner)
     return {"ok": True, "status": "звоню", "to": name,
-            "note": "итог звонка придёт владельцу сообщением в userbot" if not call.owner else "звоню владельцу"}
+            "note": ("разговор идёт в фоне, итог придёт владельцу сообщением сам — ответь ему «звоню» сейчас, "
+                     "не жди и не проверяй расшифровки" if not call.owner else "звоню владельцу")}
 
 
 async def start(client):
