@@ -1,0 +1,6 @@
+telethon>=1.45
+cryptg
+py-tgcalls>=3.0
+numpy
+qrcode
+faster-whisper  # запасная расшифровка голосовых (stt.py)

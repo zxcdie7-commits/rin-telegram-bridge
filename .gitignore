@@ -1,0 +1,16 @@
+# секреты и личное — никогда в git
+.env
+*.session
+*.session-journal
+state.json
+public.sqlite
+calls/
+tmp/
+last_image.jpg
+send.sock
+*.log
+bridge.out
+# окружение
+venv*/
+__pycache__/
+*.bak*
